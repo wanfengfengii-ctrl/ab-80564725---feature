@@ -106,6 +106,20 @@ def make_stripe(data_count: int, size: int, seed: int) -> tuple[list[bytes], lis
     return stripe, encoded, digests
 
 
+def scatter_physical(
+    data_count: int, logical: list[bytes], p_index: int, q_index: int
+) -> list[bytes]:
+    """Lay out [D0..Dn-1, P, Q] onto physical slots of a rotated stripe."""
+    total = data_count + 2
+    physical = [b""] * total
+    data_slots = [i for i in range(total) if i != p_index and i != q_index]
+    for logical_index, slot in enumerate(data_slots):
+        physical[slot] = logical[logical_index]
+    physical[p_index] = logical[data_count]
+    physical[q_index] = logical[data_count + 1]
+    return physical
+
+
 def expect(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
@@ -178,6 +192,112 @@ def run_smoke_test() -> None:
     expect(status == 409, "case 5: expected 409, got %d (%s)" % (status, body))
     expect(body["error"]["code"] == "PARITY_RELATION_MISMATCH", "case 5: wrong error code")
     expect("shards" not in body, "case 5: failure leaked shard data")
+
+    # ------------------------------------------------------------------
+    # Rotated physical layouts: P/Q are not in the final two slots.
+    # ------------------------------------------------------------------
+    rot_n, rot_size = 5, 201
+    rot_logical, _, _ = make_stripe(rot_n, rot_size, seed=20261006)
+    rot_total = rot_n + 2
+
+    def rotated_request(p_index, q_index, shards, digest_list):
+        return {
+            "dataShards": rot_n,
+            "shardSize": rot_size,
+            "parityIndices": [p_index, q_index],
+            "shards": shards,
+            "digests": digest_list,
+        }
+
+    # Case 6: layout P,Q,D0..D4 (parity at physical slots 0 and 1) with
+    # two data shards missing; reconstruction must stay in physical order.
+    p_index, q_index = 0, 1
+    physical = scatter_physical(rot_n, rot_logical, p_index, q_index)
+    physical_enc = [base64.b64encode(s).decode("ascii") for s in physical]
+    physical_digests = [hashlib.sha256(s).hexdigest() for s in physical]
+    shards = list(physical_enc)
+    shards[3] = None  # D1
+    shards[5] = None  # D3
+    status, body = http_json(
+        "POST",
+        "/api/stripes/reconstruct",
+        rotated_request(p_index, q_index, shards, physical_digests),
+    )
+    expect(status == 200, "case 6: expected 200, got %d (%s)" % (status, body))
+    expect(body["parityIndices"] == [0, 1], "case 6: parityIndices not echoed")
+    expect(body["recoveredIndices"] == [3, 5], "case 6: wrong recoveredIndices")
+    expect(body["shards"] == physical_enc, "case 6: reconstructed shards differ")
+    expect(body["digests"] == physical_digests, "case 6: digest order drifted")
+
+    # Case 7: one data slot plus the Q physical slot missing; the Q slot
+    # is slot 1 here, so recoveredIndices must name physical slot 1.
+    shards = list(physical_enc)
+    shards[2] = None  # D0
+    shards[q_index] = None
+    status, body = http_json(
+        "POST",
+        "/api/stripes/reconstruct",
+        rotated_request(p_index, q_index, shards, physical_digests),
+    )
+    expect(status == 200, "case 7: expected 200, got %d (%s)" % (status, body))
+    expect(body["recoveredIndices"] == [1, 2], "case 7: wrong recoveredIndices")
+    expect(body["shards"] == physical_enc, "case 7: reconstructed shards differ")
+
+    # Case 8: illegal parity index (out of range) -> locatable 422.
+    shards = list(physical_enc)
+    status, body = http_json(
+        "POST",
+        "/api/stripes/reconstruct",
+        rotated_request(rot_total, 1, shards, physical_digests),
+    )
+    expect(status == 422, "case 8: expected 422, got %d (%s)" % (status, body))
+    expect(body["error"]["code"] == "INVALID_PARITY_INDICES", "case 8: wrong code")
+    expect(body["error"]["shardIndex"] == rot_total, "case 8: wrong physical index")
+    expect("shards" not in body, "case 8: failure leaked shard data")
+
+    # Case 9: repeated parity index (P == Q slot) -> locatable 422.
+    status, body = http_json(
+        "POST",
+        "/api/stripes/reconstruct",
+        rotated_request(3, 3, physical_enc, physical_digests),
+    )
+    expect(status == 422, "case 9: expected 422, got %d (%s)" % (status, body))
+    expect(body["error"]["code"] == "DUPLICATE_PARITY_INDEX", "case 9: wrong code")
+    expect(body["error"]["shardIndex"] == 3, "case 9: wrong physical index")
+
+    # Case 10: valid layout but a surviving shard contradicts its digest;
+    # the reported index must be the physical disk slot, not a logical one.
+    shards = list(physical_enc)
+    corrupted = bytes([physical[4][0] ^ 0x7E]) + physical[4][1:]
+    shards[4] = base64.b64encode(corrupted).decode("ascii")
+    status, body = http_json(
+        "POST",
+        "/api/stripes/reconstruct",
+        rotated_request(p_index, q_index, shards, physical_digests),
+    )
+    expect(status == 409, "case 10: expected 409, got %d (%s)" % (status, body))
+    expect(body["error"]["code"] == "SHARD_DIGEST_MISMATCH", "case 10: wrong code")
+    expect(body["error"]["shardIndex"] == 4, "case 10: wrong physical slot")
+    expect("shards" not in body, "case 10: failure leaked shard data")
+
+    # Case 11: valid layout, digests self-consistent, but the P relation
+    # does not hold at the named physical P slot -> 409 with physical slots.
+    shards = list(physical_enc)
+    bad_p = bytes(b ^ 0x3C for b in physical[p_index])
+    shards[p_index] = base64.b64encode(bad_p).decode("ascii")
+    bad_digests = list(physical_digests)
+    bad_digests[p_index] = hashlib.sha256(bad_p).hexdigest()
+    status, body = http_json(
+        "POST",
+        "/api/stripes/reconstruct",
+        rotated_request(p_index, q_index, shards, bad_digests),
+    )
+    expect(status == 409, "case 11: expected 409, got %d (%s)" % (status, body))
+    expect(body["error"]["code"] == "PARITY_RELATION_MISMATCH", "case 11: wrong code")
+    expect(body["error"]["pIndex"] == 0 and body["error"]["qIndex"] == 1,
+           "case 11: wrong physical parity indices")
+    expect("P" in body["error"]["parity"], "case 11: P defect not reported")
+    expect("shards" not in body, "case 11: failure leaked shard data")
 
 
 # --------------------------------------------------------------------------

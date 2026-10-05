@@ -9,6 +9,12 @@ shards:
   generator (primitive polynomial 0x11d).
 
 Any one or two missing shards can be reconstructed from the survivors.
+
+Newer controllers rotate the physical slots holding P and Q within a
+stripe; :func:`reconstruct_physical_stripe` accepts explicit physical
+P/Q slot indices and maps every other physical slot (in ascending
+order) onto D0..Dn-1, so callers never have to physically reorder the
+shards themselves.
 """
 
 from __future__ import annotations
@@ -58,6 +64,59 @@ def parity_defects(data_shards: list[bytes], p: bytes, q: bytes) -> list[str]:
     if q != expected_q:
         defects.append("Q")
     return defects
+
+
+def data_positions(data_count: int, p_index: int, q_index: int) -> list[int]:
+    """Physical slots holding D0..Dn-1 under a (possibly rotated) layout.
+
+    The two parity slots are skipped; every other physical slot, in
+    ascending physical index order, corresponds to one logical data
+    shard. Q coefficients are computed from that logical numbering.
+    """
+    total = data_count + 2
+    if not (0 <= p_index < total and 0 <= q_index < total and p_index != q_index):
+        raise ValueError(
+            "p_index and q_index must be distinct indices in [0, %d)" % total
+        )
+    return [i for i in range(total) if i != p_index and i != q_index]
+
+
+def reconstruct_physical_stripe(
+    physical_shards: list[bytes | None],
+    data_count: int,
+    p_index: int,
+    q_index: int,
+) -> tuple[list[bytes], list[int]]:
+    """Reconstruct a stripe whose P/Q may occupy any two physical slots.
+
+    ``physical_shards`` has ``data_count + 2`` entries in physical slot
+    order (``None`` marks a missing shard); ``p_index``/``q_index`` name
+    the physical slots currently holding P and Q. The remaining slots in
+    ascending physical index order carry D0..Dn-1. Returns
+    ``(full_physical_shards, recovered_physical_indices)``; nothing is
+    reordered in the caller's physical coordinate system.
+    """
+    total = data_count + 2
+    if len(physical_shards) != total:
+        raise ValueError("expected %d shards, got %d" % (total, len(physical_shards)))
+    positions = data_positions(data_count, p_index, q_index)
+
+    # Project the physical layout onto the canonical logical layout
+    # [D0, ..., Dn-1, P, Q], reconstruct there, then scatter back.
+    logical: list[bytes | None] = [physical_shards[pos] for pos in positions]
+    logical.append(physical_shards[p_index])
+    logical.append(physical_shards[q_index])
+    full_logical, recovered_logical = reconstruct_stripe(logical, data_count)
+
+    physical_index_of_logical = [*positions, p_index, q_index]
+    full_physical: list[bytes] = [b""] * total
+    for logical_index, shard in enumerate(full_logical):
+        full_physical[physical_index_of_logical[logical_index]] = shard
+
+    recovered_physical = sorted(
+        physical_index_of_logical[k] for k in recovered_logical
+    )
+    return full_physical, recovered_physical
 
 
 def reconstruct_stripe(

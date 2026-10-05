@@ -10,10 +10,21 @@ RAID-6 风格的双校验条带恢复服务。连续观测数据被写成 `N` �
 
 - 域：GF(2⁸)，本原多项式 `0x11d`，生成元 `2`（`app/gf256.py`）。
 - `P[j] = D_0[j] ⊕ D_1[j] ⊕ … ⊕ D_{N-1}[j]`（同位置字节异或）。
-- `Q[j] = Σ_i 2^i · D_i[j]`（GF(2⁸) 上求和，`i` 为从 0 开始的数据片索引，
-  系数 `2^i` 为生成元幂）。
+- `Q[j] = Σ_i 2^i · D_i[j]`（GF(2⁸) 上求和，`i` 为从 0 开始的**逻辑**
+  数据片序号，系数 `2^i` 为生成元幂）。
 - 任意至多两个缺片均可恢复：单数据片缺失用 P（或 Q）方程；双数据片缺失
   联立 P、Q 两方程求解；校验片缺失则由数据片重算（`app/reed_solomon.py`）。
+
+## 轮换的 P/Q 物理槽位
+
+新一代阵列控制器会轮换条带内承载 P、Q 的物理槽位以均衡写入。请求可通过
+可选的 `parityIndices: [pIndex, qIndex]` 给出两个互异的、零基物理索引；
+省略时仍按末两片（`[dataShards, dataShards+1]`）为 P、Q 处理。
+
+确定布局后，其余物理槽位**按物理索引递增**依次承载 `D0 … Dn-1`，Q 的
+系数仍按该逻辑数据序号计算（与物理位置无关）。请求与成功响应中的
+`shards`、`digests`、`recoveredIndices` 全部保持物理槽位顺序，所有错误
+（摘要矛盾、P/Q 关系矛盾）也一律报告物理索引；归档端无需自行搬移分片。
 
 ## API
 
@@ -25,15 +36,20 @@ RAID-6 风格的双校验条带恢复服务。连续观测数据被写成 `N` �
 {
   "dataShards": 4,
   "shardSize": 1024,
+  "parityIndices": [0, 3],
   "shards":  ["<base64>", null, "<base64>", "<base64>", "<base64>", null],
   "digests": ["<sha256-hex>", "... 共 dataShards+2 条 ..."]
 }
 ```
 
 - `dataShards`：2–16；`shardSize`：1–4096 字节。
-- `shards` 长度必须为 `dataShards + 2`，按索引排列，末两片依次为 P、Q；
-  缺片用 `null` 表示，现存片为标准 Base64，解码后长度须等于 `shardSize`。
-- `digests` 为每片（含缺片）预期的 SHA-256 十六进制串。
+- `parityIndices`（可选）：`[pIndex, qIndex]` 一对互异的零基物理槽位
+  索引；省略等价于 `[dataShards, dataShards+1]`（末两片为 P、Q）。
+- `shards` 长度必须为 `dataShards + 2`，按**物理槽位**排列；例如
+  `parityIndices [0,3]` 表示物理槽位 0=P、3=Q，其余槽位 1,2,4,5 按递增
+  顺序承载 D0,D1,D2,D3。缺片用 `null` 表示，现存片为标准 Base64，解码后
+  长度须等于 `shardSize`。
+- `digests` 为每片（含缺片）按物理槽位排列的预期 SHA-256 十六进制串。
 
 成功 `200`：
 
@@ -42,9 +58,10 @@ RAID-6 风格的双校验条带恢复服务。连续观测数据被写成 `N` �
   "dataShards": 4,
   "shardSize": 1024,
   "shardCount": 6,
-  "shards": ["<base64>", "… 全部 6 片，按原索引，规范 Base64 …"],
+  "parityIndices": [0, 3],
+  "shards": ["<base64>", "… 全部 6 片，按物理槽位顺序，规范 Base64 …"],
   "recoveredIndices": [1, 5],
-  "digests": ["<每片实际 SHA-256>"]
+  "digests": ["<每片实际 SHA-256，按物理槽位顺序>"]
 }
 ```
 
@@ -60,10 +77,12 @@ RAID-6 风格的双校验条带恢复服务。连续观测数据被写成 `N` �
 | 422 | `INVALID_SHARD_COUNT` / `INVALID_DIGEST_COUNT` | 数组长度与 `dataShards+2` 不符 |
 | 422 | `INVALID_SHARD_ENCODING` / `SHARD_SIZE_MISMATCH` | 分片非规范 Base64 或长度不符 |
 | 422 | `INVALID_DIGEST_FORMAT` | 摘要非 64 位十六进制 |
-| 422 | `TOO_MANY_MISSING_SHARDS` | 缺片超过 2 个，超出恢复能力（附 `missingIndices`） |
-| 409 | `SHARD_DIGEST_MISMATCH` | 现存片与预期摘要矛盾；**不会**被擅自当作缺片（附 `shardIndex`） |
-| 409 | `RECONSTRUCTED_DIGEST_MISMATCH` | 重建片与预期摘要矛盾，幸存数据与归档元数据不一致（附 `shardIndex`） |
-| 409 | `PARITY_RELATION_MISMATCH` | 拼合后的条带不满足 P/Q 校验关系（附 `parity`、`pIndex`、`qIndex`） |
+| 422 | `INVALID_PARITY_INDICES` | `parityIndices` 不是二元数组、元素非整数或物理索引越界（附可定位的 `shardIndex`） |
+| 422 | `DUPLICATE_PARITY_INDEX` | `parityIndices` 两个物理索引相同（附 `shardIndex`） |
+| 422 | `TOO_MANY_MISSING_SHARDS` | 缺片超过 2 个，超出恢复能力（附物理槽位 `missingIndices`） |
+| 409 | `SHARD_DIGEST_MISMATCH` | 现存片与预期摘要矛盾；**不会**被擅自当作缺片（附物理槽位 `shardIndex`） |
+| 409 | `RECONSTRUCTED_DIGEST_MISMATCH` | 重建片与预期摘要矛盾，幸存数据与归档元数据不一致（附物理槽位 `shardIndex`） |
+| 409 | `PARITY_RELATION_MISMATCH` | 拼合后的条带不满足 P/Q 校验关系（附 `parity`、物理槽位 `pIndex`、`qIndex`） |
 
 ### `GET /health`
 
@@ -97,7 +116,7 @@ python3 verify.py                       # 对 http://localhost:8000 跑完整 ve
 
 ```
 app/gf256.py          GF(2^8) 算术（0x11d，生成元 2）
-app/reed_solomon.py   P/Q 计算、条带重建与校验关系核验
+app/reed_solomon.py   P/Q 计算、条带重建与校验关系核验（含轮换物理槽位布局）
 app/service.py        请求校验、摘要核验、错误分类（422/409）
 app/server.py         标准库 HTTP 服务（/health、/api/stripes/reconstruct）
 tests/                单元测试（穷举全部单/双缺片组合）

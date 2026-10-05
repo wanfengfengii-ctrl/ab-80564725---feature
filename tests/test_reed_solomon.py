@@ -86,5 +86,86 @@ class TestReconstruction(unittest.TestCase):
         self.assertEqual(recovered, [0, 17])
 
 
+def rotate_layout(logical_stripe, data_count, p_index, q_index):
+    """Scatter [D0..Dn-1, P, Q] into physical slots for the given layout."""
+    total = data_count + 2
+    positions = rs.data_positions(data_count, p_index, q_index)
+    physical = [b""] * total
+    for logical_index, shard in enumerate(logical_stripe[:data_count]):
+        physical[positions[logical_index]] = shard
+    physical[p_index] = logical_stripe[data_count]
+    physical[q_index] = logical_stripe[data_count + 1]
+    return physical
+
+
+class TestRotatedPhysicalLayout(unittest.TestCase):
+    def test_data_positions_skip_parity_slots(self):
+        # P/Q at slots 1 and 3 of a 6-slot stripe -> data slots 0,2,4,5.
+        self.assertEqual(rs.data_positions(4, 1, 3), [0, 2, 4, 5])
+        # Default layout: parity at the end, data fills the front.
+        self.assertEqual(rs.data_positions(4, 4, 5), [0, 1, 2, 3])
+
+    def test_every_layout_and_erasure_pair_roundtrips(self):
+        rng = random.Random(5150)
+        for data_count in (2, 5, 16):
+            logical = make_stripe(data_count, 80, rng)
+            total = data_count + 2
+            for p_index in range(total):
+                for q_index in range(total):
+                    if p_index == q_index:
+                        continue
+                    physical = rotate_layout(
+                        logical, data_count, p_index, q_index
+                    )
+                    raw_cases = [
+                        (0,),
+                        (p_index,),
+                        (q_index,),
+                        tuple(sorted((0, p_index))),
+                        tuple(sorted((p_index, q_index))),
+                    ]
+                    cases = {
+                        missing
+                        for missing in raw_cases
+                        if len(set(missing)) == len(missing)
+                    }
+                    for missing in cases:
+                        damaged = [
+                            None if i in missing else s
+                            for i, s in enumerate(physical)
+                        ]
+                        full, recovered = rs.reconstruct_physical_stripe(
+                            damaged, data_count, p_index, q_index
+                        )
+                        self.assertEqual(
+                            full,
+                            physical,
+                            "n=%d p=%d q=%d missing=%s"
+                            % (data_count, p_index, q_index, missing),
+                        )
+                        self.assertEqual(sorted(recovered), list(missing))
+
+    def test_q_coefficient_follows_logical_data_numbering(self):
+        # Layout P,Q,D0,D1: the data shards occupy late physical slots but
+        # Q must still be D0 + 2*D1, not weighted by physical position.
+        # Erase both data slots (2, 3); the Q equation only solves correctly
+        # when coefficients follow the logical numbering.
+        rng = random.Random(808)
+        logical = make_stripe(2, 48, rng)
+        physical = rotate_layout(logical, 2, p_index=0, q_index=1)
+        damaged = [None if i in (2, 3) else s for i, s in enumerate(physical)]
+        full, recovered = rs.reconstruct_physical_stripe(damaged, 2, 0, 1)
+        self.assertEqual(full, physical)
+        self.assertEqual(recovered, [2, 3])
+
+    def test_invalid_physical_parity_indices_rejected(self):
+        with self.assertRaises(ValueError):
+            rs.data_positions(4, 2, 2)
+        with self.assertRaises(ValueError):
+            rs.data_positions(4, -1, 3)
+        with self.assertRaises(ValueError):
+            rs.data_positions(4, 0, 6)
+
+
 if __name__ == "__main__":
     unittest.main()
