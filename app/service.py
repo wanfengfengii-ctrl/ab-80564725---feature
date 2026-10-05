@@ -9,6 +9,11 @@ Error taxonomy
   a reconstructed shard does not match its expected digest, or the
   P/Q parity relations are inconsistent.
 
+Shards are always addressed by their *physical* slot indices. The
+optional ``parityIndices`` field names the physical slots holding P and
+Q (the remaining slots are D0..Dn-1 in ascending physical order); all
+error locations therefore point at real disk slots.
+
 No error response ever contains shard data; only a fully verified
 stripe is returned.
 """
@@ -103,7 +108,66 @@ def _decode_shard(value: Any, index: int, shard_size: int) -> bytes:
     return raw
 
 
-def _parse_request(body: Any) -> tuple[int, int, list[bytes | None], list[str]]:
+def _parse_parity_indices(
+    body: dict[str, Any], shard_count: int, data_shards: int
+) -> tuple[int, int]:
+    """Extract and validate the optional ``parityIndices`` [p, q].
+
+    Absent or null means the canonical layout (P, Q in the last two
+    slots). Malformed, out-of-range or duplicated indices are 422 with
+    the offending physical index reported so archivists can locate it.
+    """
+    if "parityIndices" not in body or body["parityIndices"] is None:
+        return data_shards, data_shards + 1
+
+    raw = body["parityIndices"]
+    if not isinstance(raw, list) or len(raw) != 2:
+        raise ApiError(
+            422,
+            "INVALID_PARITY_INDICES",
+            "field 'parityIndices' must be a [pIndex, qIndex] pair of "
+            "distinct integers, or be omitted",
+            field="parityIndices",
+        )
+
+    indices: list[int] = []
+    for position, value in enumerate(raw):
+        label = "p" if position == 0 else "q"
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ApiError(
+                422,
+                "INVALID_PARITY_INDEX",
+                "parityIndices.%s must be an integer physical slot index" % label,
+                field="parityIndices",
+                parity=label,
+            )
+        if not (0 <= value < shard_count):
+            raise ApiError(
+                422,
+                "PARITY_INDEX_OUT_OF_RANGE",
+                "parityIndices.%s = %d is outside the valid physical slot "
+                "range [0, %d)" % (label, value, shard_count),
+                field="parityIndices",
+                parity=label,
+                parityIndex=value,
+            )
+        indices.append(value)
+
+    if indices[0] == indices[1]:
+        raise ApiError(
+            422,
+            "DUPLICATE_PARITY_INDEX",
+            "P and Q must occupy distinct physical slots; both name slot %d"
+            % indices[0],
+            field="parityIndices",
+            parityIndex=indices[0],
+        )
+    return indices[0], indices[1]
+
+
+def _parse_request(
+    body: Any,
+) -> tuple[int, int, list[bytes | None], list[str], int, int]:
     if not isinstance(body, dict):
         raise ApiError(422, "INVALID_BODY", "request body must be a JSON object")
 
@@ -115,6 +179,8 @@ def _parse_request(body: Any) -> tuple[int, int, list[bytes | None], list[str]]:
     )
 
     shard_count = data_shards + 2
+    p_index, q_index = _parse_parity_indices(body, shard_count, data_shards)
+
     raw_shards = body.get("shards")
     if not isinstance(raw_shards, list) or len(raw_shards) != shard_count:
         raise ApiError(
@@ -149,7 +215,7 @@ def _parse_request(body: Any) -> tuple[int, int, list[bytes | None], list[str]]:
             )
         digests.append(item.lower())
 
-    return data_shards, shard_size, shards, digests
+    return data_shards, shard_size, shards, digests, p_index, q_index
 
 
 def reconstruct_stripe_request(body: Any) -> dict[str, Any]:
@@ -158,7 +224,7 @@ def reconstruct_stripe_request(body: Any) -> dict[str, Any]:
     Returns the success response payload; raises :class:`ApiError`
     otherwise. A failure response never carries shard material.
     """
-    data_shards, shard_size, shards, digests = _parse_request(body)
+    data_shards, shard_size, shards, digests, p_index, q_index = _parse_request(body)
     shard_count = data_shards + 2
 
     missing = [i for i, s in enumerate(shards) if s is None]
@@ -173,18 +239,20 @@ def reconstruct_stripe_request(body: Any) -> dict[str, Any]:
 
     # Surviving shards must match their expected digests. A mismatch is a
     # contradiction (possible silent corruption), never a licence to treat
-    # the shard as missing.
+    # the shard as missing. All indices are physical slot positions.
     for i, shard in enumerate(shards):
         if shard is not None and _sha256_hex(shard) != digests[i]:
             raise ApiError(
                 409,
                 "SHARD_DIGEST_MISMATCH",
-                "surviving shard %d does not match its expected SHA-256; "
-                "refusing to treat it as missing" % i,
+                "surviving shard at physical slot %d does not match its "
+                "expected SHA-256; refusing to treat it as missing" % i,
                 shardIndex=i,
             )
 
-    full, recovered = rs.reconstruct_stripe(shards, data_shards)
+    full, recovered = rs.reconstruct_stripe(
+        shards, data_shards, p_index=p_index, q_index=q_index
+    )
 
     # Reconstructed shards must match their expected digests, otherwise the
     # surviving material contradicts the archival metadata.
@@ -193,30 +261,35 @@ def reconstruct_stripe_request(body: Any) -> dict[str, Any]:
             raise ApiError(
                 409,
                 "RECONSTRUCTED_DIGEST_MISMATCH",
-                "reconstructed shard %d does not match its expected SHA-256; "
-                "surviving shards and digests are contradictory" % i,
+                "reconstructed shard at physical slot %d does not match its "
+                "expected SHA-256; surviving shards and digests are "
+                "contradictory" % i,
                 shardIndex=i,
             )
 
-    # The complete stripe must satisfy both parity relations.
-    defects = rs.parity_defects(
-        full[:data_shards], full[data_shards], full[data_shards + 1]
-    )
+    # The complete stripe must satisfy both parity relations. Data shards
+    # are the physical slots other than P/Q in ascending order; their list
+    # position is the logical index whose 2**i coefficient feeds Q.
+    data_slots = [i for i in range(shard_count) if i != p_index and i != q_index]
+    data_shard_values = [full[i] for i in data_slots]
+    defects = rs.parity_defects(data_shard_values, full[p_index], full[q_index])
     if defects:
         raise ApiError(
             409,
             "PARITY_RELATION_MISMATCH",
-            "parity relation(s) %s do not hold for the assembled stripe"
-            % ", ".join(defects),
+            "parity relation(s) %s do not hold for the assembled stripe "
+            "(P at physical slot %d, Q at physical slot %d)"
+            % (", ".join(defects), p_index, q_index),
             parity=defects,
-            pIndex=data_shards,
-            qIndex=data_shards + 1,
+            pIndex=p_index,
+            qIndex=q_index,
         )
 
     return {
         "dataShards": data_shards,
         "shardSize": shard_size,
         "shardCount": shard_count,
+        "parityIndices": [p_index, q_index],
         "shards": [base64.b64encode(s).decode("ascii") for s in full],
         "recoveredIndices": recovered,
         "digests": [_sha256_hex(s) for s in full],

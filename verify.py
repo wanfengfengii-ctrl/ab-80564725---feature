@@ -106,6 +106,28 @@ def make_stripe(data_count: int, size: int, seed: int) -> tuple[list[bytes], lis
     return stripe, encoded, digests
 
 
+def rotate_stripe(
+    data_count: int, logical_stripe: list[bytes], p_index: int, q_index: int
+) -> list[bytes]:
+    """Lay out [D0..Dn-1, P, Q] physically with P/Q at rotated slots."""
+    total = data_count + 2
+    data_slots = [i for i in range(total) if i != p_index and i != q_index]
+    physical: list[bytes] = [b""] * total
+    for logical_i, physical_i in enumerate(data_slots):
+        physical[physical_i] = logical_stripe[logical_i]
+    physical[p_index] = logical_stripe[data_count]
+    physical[q_index] = logical_stripe[data_count + 1]
+    return physical
+
+
+def encode_stripe(stripe: list[bytes]) -> list[str]:
+    return [base64.b64encode(s).decode("ascii") for s in stripe]
+
+
+def digest_stripe(stripe: list[bytes]) -> list[str]:
+    return [hashlib.sha256(s).hexdigest() for s in stripe]
+
+
 def expect(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
@@ -178,6 +200,86 @@ def run_smoke_test() -> None:
     expect(status == 409, "case 5: expected 409, got %d (%s)" % (status, body))
     expect(body["error"]["code"] == "PARITY_RELATION_MISMATCH", "case 5: wrong error code")
     expect("shards" not in body, "case 5: failure leaked shard data")
+
+    # Case 6: rotated P/Q layout -- the controller placed P at physical
+    # slot 1 and Q at slot 4; slots 0,2,3,5 are D0..D3 in ascending order.
+    r_data_count, r_size = 4, 193
+    r_logical, _, _ = make_stripe(r_data_count, r_size, seed=20261006)
+    r_p_index, r_q_index = 1, 4
+    r_stripe = rotate_stripe(r_data_count, r_logical, r_p_index, r_q_index)
+    r_encoded = encode_stripe(r_stripe)
+    r_digests = digest_stripe(r_stripe)
+
+    def rotated_request(shards):
+        return {
+            "dataShards": r_data_count,
+            "shardSize": r_size,
+            "parityIndices": [r_p_index, r_q_index],
+            "shards": shards,
+            "digests": r_digests,
+        }
+
+    shards = list(r_encoded)
+    shards[0] = None   # D0 missing
+    shards[4] = None   # Q missing
+    status, body = http_json("POST", "/api/stripes/reconstruct", rotated_request(shards))
+    expect(status == 200, "case 6: expected 200, got %d (%s)" % (status, body))
+    expect(body["parityIndices"] == [1, 4], "case 6: parityIndices not echoed")
+    expect(body["recoveredIndices"] == [0, 4], "case 6: wrong recoveredIndices")
+    expect(body["shards"] == r_encoded, "case 6: rotated reconstruction differs")
+    expect(body["digests"] == r_digests, "case 6: digest list mismatch")
+
+    # Case 7: illegal / duplicate parity indices are locatable 422s.
+    bad_body = {
+        "dataShards": r_data_count,
+        "shardSize": r_size,
+        "parityIndices": [1, 7],  # 7 outside [0, 6)
+        "shards": r_encoded,
+        "digests": r_digests,
+    }
+    status, body = http_json("POST", "/api/stripes/reconstruct", bad_body)
+    expect(status == 422, "case 7a: expected 422, got %d (%s)" % (status, body))
+    expect(body["error"]["code"] == "PARITY_INDEX_OUT_OF_RANGE", "case 7a: wrong code")
+    expect(body["error"]["parityIndex"] == 7, "case 7a: physical index not reported")
+    expect("shards" not in body, "case 7a: failure leaked shard data")
+
+    bad_body["parityIndices"] = [2, 2]
+    status, body = http_json("POST", "/api/stripes/reconstruct", bad_body)
+    expect(status == 422, "case 7b: expected 422, got %d (%s)" % (status, body))
+    expect(body["error"]["code"] == "DUPLICATE_PARITY_INDEX", "case 7b: wrong code")
+    expect(body["error"]["parityIndex"] == 2, "case 7b: physical index not reported")
+
+    # Case 8: layout is legal but the Q relation contradicts (digests
+    # self-consistent) -> 409 naming the real physical Q slot.
+    sys.path.insert(0, ROOT)
+    from app import gf256 as gf
+
+    forged_q = bytes(r_size)
+    for logical_i, physical_i in enumerate((0, 2, 3, 5)):
+        forged_q = bytes(
+            a ^ b
+            for a, b in zip(forged_q, gf.mul_bytes(gf.pow2(physical_i), r_stripe[physical_i]))
+        )
+    shards = list(r_encoded)
+    shards[r_q_index] = base64.b64encode(forged_q).decode("ascii")
+    tampered = list(r_digests)
+    tampered[r_q_index] = hashlib.sha256(forged_q).hexdigest()
+    status, body = http_json(
+        "POST",
+        "/api/stripes/reconstruct",
+        {
+            "dataShards": r_data_count,
+            "shardSize": r_size,
+            "parityIndices": [r_p_index, r_q_index],
+            "shards": shards,
+            "digests": tampered,
+        },
+    )
+    expect(status == 409, "case 8: expected 409, got %d (%s)" % (status, body))
+    expect(body["error"]["code"] == "PARITY_RELATION_MISMATCH", "case 8: wrong code")
+    expect(body["error"]["parity"] == ["Q"], "case 8: expected only the Q relation")
+    expect(body["error"]["qIndex"] == r_q_index, "case 8: wrong physical qIndex")
+    expect("shards" not in body, "case 8: failure leaked shard data")
 
 
 # --------------------------------------------------------------------------

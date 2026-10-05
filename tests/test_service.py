@@ -15,17 +15,33 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def make_request(data_count=4, size=64, seed=42):
+def make_request(data_count=4, size=64, seed=42, parity_indices=None):
     rng = random.Random(seed)
     data = [rng.randbytes(size) for _ in range(data_count)]
     p, q = rs.compute_parity(data)
-    stripe = data + [p, q]
-    return {
+    if parity_indices is None:
+        p_index, q_index = data_count, data_count + 1
+        stripe = data + [p, q]
+        request_parity = None
+    else:
+        p_index, q_index = parity_indices
+        total = data_count + 2
+        data_slots = [i for i in range(total) if i != p_index and i != q_index]
+        stripe = [b""] * total
+        for logical_i, physical_i in enumerate(data_slots):
+            stripe[physical_i] = data[logical_i]
+        stripe[p_index] = p
+        stripe[q_index] = q
+        request_parity = [p_index, q_index]
+    body = {
         "dataShards": data_count,
         "shardSize": size,
         "shards": [b64(s) for s in stripe],
         "digests": [sha(s) for s in stripe],
-    }, stripe
+    }
+    if request_parity is not None:
+        body["parityIndices"] = request_parity
+    return body, stripe
 
 
 class TestSuccess(unittest.TestCase):
@@ -62,6 +78,182 @@ class TestSuccess(unittest.TestCase):
         result = reconstruct_stripe_request(body)
         self.assertEqual(result["recoveredIndices"], [2, 6])
         self.assertEqual(result["shards"], [b64(s) for s in stripe])
+
+
+class TestRotatedLayout(unittest.TestCase):
+    ROTATED_LAYOUTS = [(0, 1), (1, 0), (0, 5), (5, 0), (2, 4), (4, 1)]
+
+    def test_full_rotated_stripes_returned_in_physical_order(self):
+        for layout in self.ROTATED_LAYOUTS:
+            body, stripe = make_request(parity_indices=layout)
+            result = reconstruct_stripe_request(body)
+            self.assertEqual(result["parityIndices"], list(layout))
+            self.assertEqual(
+                result["shards"], [b64(s) for s in stripe], "layout=%s" % (layout,)
+            )
+            self.assertEqual(result["recoveredIndices"], [])
+            self.assertEqual(
+                result["digests"], [sha(s) for s in stripe], "layout=%s" % (layout,)
+            )
+
+    def test_default_response_also_echoes_canonical_parity_indices(self):
+        body, stripe = make_request()
+        result = reconstruct_stripe_request(body)
+        self.assertEqual(result["parityIndices"], [4, 5])
+
+    def test_two_missing_shards_recovered_in_rotated_layout(self):
+        # P at physical slot 1, Q at slot 4; erase a data slot and Q.
+        body, stripe = make_request(
+            data_count=4, size=70, seed=9, parity_indices=(1, 4)
+        )
+        body["shards"][0] = None  # D0
+        body["shards"][4] = None  # Q
+        result = reconstruct_stripe_request(body)
+        self.assertEqual(result["recoveredIndices"], [0, 4])
+        self.assertEqual(result["shards"], [b64(s) for s in stripe])
+
+    def test_missing_rotated_parity_shards_recomputed(self):
+        body, stripe = make_request(
+            data_count=3, size=21, seed=13, parity_indices=(0, 1)
+        )
+        body["shards"][0] = None  # P
+        body["shards"][1] = None  # Q
+        result = reconstruct_stripe_request(body)
+        self.assertEqual(result["recoveredIndices"], [0, 1])
+        self.assertEqual(result["shards"], [b64(s) for s in stripe])
+
+    def test_all_erasure_pairs_recovered_for_rotated_layouts(self):
+        import itertools
+
+        for layout in ((0, 3), (2, 5)):
+            body, stripe = make_request(
+                data_count=4, size=50, seed=21, parity_indices=layout
+            )
+            total = 6
+            for missing in itertools.combinations(range(total), 2):
+                damaged = dict(body)
+                damaged["shards"] = list(body["shards"])
+                for i in missing:
+                    damaged["shards"][i] = None
+                result = reconstruct_stripe_request(damaged)
+                self.assertEqual(
+                    result["shards"],
+                    [b64(s) for s in stripe],
+                    "layout=%s missing=%s" % (layout, missing),
+                )
+                self.assertEqual(result["recoveredIndices"], list(missing))
+
+
+class TestParityIndexValidation(unittest.TestCase):
+    def assert_422(self, body, code):
+        with self.assertRaises(ApiError) as ctx:
+            reconstruct_stripe_request(body)
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, code)
+        self.assertNotIn("shards", ctx.exception.body())
+        return ctx.exception
+
+    def test_rejects_non_array_parity_indices(self):
+        body, _ = make_request()
+        body["parityIndices"] = {"p": 4}
+        self.assert_422(body, "INVALID_PARITY_INDICES")
+        body["parityIndices"] = [4]
+        self.assert_422(body, "INVALID_PARITY_INDICES")
+        body["parityIndices"] = [4, 5, 0]
+        self.assert_422(body, "INVALID_PARITY_INDICES")
+
+    def test_rejects_non_integer_entries(self):
+        body, _ = make_request()
+        body["parityIndices"] = [4, "5"]
+        err = self.assert_422(body, "INVALID_PARITY_INDEX")
+        self.assertEqual(err.body()["error"]["parity"], "q")
+        body["parityIndices"] = [True, 5]
+        err = self.assert_422(body, "INVALID_PARITY_INDEX")
+        self.assertEqual(err.body()["error"]["parity"], "p")
+        body["parityIndices"] = [None, 5]
+        self.assert_422(body, "INVALID_PARITY_INDEX")
+
+    def test_rejects_out_of_range_index_with_physical_value(self):
+        body, _ = make_request(data_count=4)
+        body["parityIndices"] = [4, 6]
+        err = self.assert_422(body, "PARITY_INDEX_OUT_OF_RANGE")
+        error = err.body()["error"]
+        self.assertEqual(error["parity"], "q")
+        self.assertEqual(error["parityIndex"], 6)
+        body["parityIndices"] = [-1, 5]
+        err = self.assert_422(body, "PARITY_INDEX_OUT_OF_RANGE")
+        self.assertEqual(err.body()["error"]["parityIndex"], -1)
+
+    def test_rejects_duplicate_parity_slots(self):
+        body, _ = make_request()
+        body["parityIndices"] = [3, 3]
+        err = self.assert_422(body, "DUPLICATE_PARITY_INDEX")
+        self.assertEqual(err.body()["error"]["parityIndex"], 3)
+
+    def test_null_parity_indices_means_canonical_layout(self):
+        body, stripe = make_request()
+        body["parityIndices"] = None
+        result = reconstruct_stripe_request(body)
+        self.assertEqual(result["parityIndices"], [4, 5])
+        self.assertEqual(result["shards"], [b64(s) for s in stripe])
+
+
+class TestRotatedConflict(unittest.TestCase):
+    def assert_409(self, body, code):
+        with self.assertRaises(ApiError) as ctx:
+            reconstruct_stripe_request(body)
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.code, code)
+        self.assertNotIn("shards", ctx.exception.body())
+        return ctx.exception
+
+    def test_corrupt_survivor_reports_physical_slot(self):
+        body, stripe = make_request(parity_indices=(0, 1))
+        # Physical slot 2 is D0; corrupt it in place.
+        corrupted = bytes([stripe[2][0] ^ 0x0F]) + stripe[2][1:]
+        body["shards"][2] = b64(corrupted)
+        err = self.assert_409(body, "SHARD_DIGEST_MISMATCH")
+        self.assertEqual(err.body()["error"]["shardIndex"], 2)
+
+    def test_reconstructed_digest_mismatch_reports_physical_slot(self):
+        body, _ = make_request(parity_indices=(1, 4))
+        body["shards"][3] = None  # a data slot
+        body["digests"][3] = sha(b"not the real reconstructed shard")
+        err = self.assert_409(body, "RECONSTRUCTED_DIGEST_MISMATCH")
+        self.assertEqual(err.body()["error"]["shardIndex"], 3)
+
+    def test_parity_contradiction_reports_rotated_slots(self):
+        body, stripe = make_request(parity_indices=(2, 0))  # Q at slot 0
+        bad_q = bytes(b ^ 0xC3 for b in stripe[0])
+        body["shards"][0] = b64(bad_q)
+        body["digests"][0] = sha(bad_q)
+        err = self.assert_409(body, "PARITY_RELATION_MISMATCH")
+        error = err.body()["error"]
+        self.assertEqual(error["parity"], ["Q"])
+        self.assertEqual(error["pIndex"], 2)
+        self.assertEqual(error["qIndex"], 0)
+
+    def test_rotated_layout_detects_q_relation_that_canonical_ordering_misses(self):
+        # Build a rotated stripe where P is fine but Q was computed with
+        # the *physical* (wrong) coefficient order instead of the logical
+        # data order. Digests stay self-consistent, so only the Q relation
+        # must trip -- and only when Q coefficients follow logical order.
+        body, stripe = make_request(
+            data_count=4, size=40, seed=31, parity_indices=(0, 5)
+        )
+        # Slots 1..4 are D0..D3. Forge Q using physical-order coefficients
+        # 2^1..2^4 instead of logical 2^0..2^3.
+        from app import gf256 as gf
+
+        forged_q = bytes(40)
+        for logical_i, physical_i in enumerate((1, 2, 3, 4)):
+            coef = gf.pow2(physical_i)  # wrong: physical, not logical
+            forged_q = bytes(a ^ b for a, b in zip(forged_q, gf.mul_bytes(coef, stripe[physical_i])))
+        body["shards"][5] = b64(forged_q)
+        body["digests"][5] = sha(forged_q)
+        err = self.assert_409(body, "PARITY_RELATION_MISMATCH")
+        self.assertEqual(err.body()["error"]["parity"], ["Q"])
+        self.assertEqual(err.body()["error"]["qIndex"], 5)
 
 
 class TestUnprocessable(unittest.TestCase):

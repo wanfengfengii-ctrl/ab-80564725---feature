@@ -86,5 +86,90 @@ class TestReconstruction(unittest.TestCase):
         self.assertEqual(recovered, [0, 17])
 
 
+def make_rotated_stripe(data, p, q, p_index, q_index):
+    """Place [D0..Dn-1, P, Q] into physical slots with P/Q rotated out."""
+    total = len(data) + 2
+    data_slots = [i for i in range(total) if i != p_index and i != q_index]
+    physical = [None] * total
+    for logical_i, physical_i in enumerate(data_slots):
+        physical[physical_i] = data[logical_i]
+    physical[p_index] = p
+    physical[q_index] = q
+    return physical
+
+
+class TestRotatedLayout(unittest.TestCase):
+    """New controllers rotate P/Q across physical slots to balance writes."""
+
+    LAYOUTS = [(0, 1), (1, 0), (0, 5), (5, 0), (2, 4), (4, 2), (3, 1), (5, 3)]
+
+    def test_logical_layout_maps_remaining_slots_in_ascending_order(self):
+        data_slots, p_index, q_index = rs.logical_layout(4, 1, 4)
+        self.assertEqual(p_index, 1)
+        self.assertEqual(q_index, 4)
+        self.assertEqual(data_slots, [0, 2, 3, 5])
+
+    def test_logical_layout_defaults_to_last_two_slots(self):
+        data_slots, p_index, q_index = rs.logical_layout(4)
+        self.assertEqual((p_index, q_index), (4, 5))
+        self.assertEqual(data_slots, [0, 1, 2, 3])
+
+    def test_logical_layout_rejects_invalid_indices(self):
+        with self.assertRaises(ValueError):
+            rs.logical_layout(4, 0, 6)
+        with self.assertRaises(ValueError):
+            rs.logical_layout(4, 2, 2)
+
+    def test_every_erasure_combo_recovered_for_every_rotated_layout(self):
+        rng = random.Random(2026)
+        for p_index, q_index in self.LAYOUTS:
+            data_count = 4
+            data = [rng.randbytes(96) for _ in range(data_count)]
+            p, q = rs.compute_parity(data)
+            total = data_count + 2
+            stripe = make_rotated_stripe(data, p, q, p_index, q_index)
+
+            combos = [(i,) for i in range(total)]
+            combos += list(itertools.combinations(range(total), 2))
+            for missing in combos:
+                damaged = [None if i in missing else s for i, s in enumerate(stripe)]
+                full, recovered = rs.reconstruct_stripe(
+                    damaged, data_count, p_index=p_index, q_index=q_index
+                )
+                self.assertEqual(
+                    full,
+                    stripe,
+                    "layout=(P:%d,Q:%d) missing=%s" % (p_index, q_index, missing),
+                )
+                self.assertEqual(sorted(recovered), sorted(missing))
+                # recovered indices are reported in physical slot order
+                self.assertEqual(recovered, sorted(missing))
+
+    def test_rotated_recovery_uses_logical_q_coefficients(self):
+        # Hand-checked case: P at slot 0, Q at slot 1; physical slots
+        # 2..5 are D0..D3. Erasing slot 0 (P) and slot 3 (= D1) must
+        # rebuild D1 using coefficient 2**1, i.e. the Q equation.
+        rng = random.Random(77)
+        data = [rng.randbytes(48) for _ in range(4)]
+        p, q = rs.compute_parity(data)
+        p_index, q_index = 0, 1
+        stripe = make_rotated_stripe(data, p, q, p_index, q_index)
+        damaged = [None if i in (0, 3) else s for i, s in enumerate(stripe)]
+        full, recovered = rs.reconstruct_stripe(
+            damaged, 4, p_index=p_index, q_index=q_index
+        )
+        self.assertEqual(recovered, [0, 3])
+        self.assertEqual(full, stripe)
+
+    def test_full_rotated_stripe_round_trips_unchanged(self):
+        rng = random.Random(5)
+        data = [rng.randbytes(33) for _ in range(5)]
+        p, q = rs.compute_parity(data)
+        stripe = make_rotated_stripe(data, p, q, 2, 6)
+        full, recovered = rs.reconstruct_stripe(stripe, 5, p_index=2, q_index=6)
+        self.assertEqual(full, stripe)
+        self.assertEqual(recovered, [])
+
+
 if __name__ == "__main__":
     unittest.main()

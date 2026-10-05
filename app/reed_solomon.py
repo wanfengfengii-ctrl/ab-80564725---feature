@@ -1,12 +1,18 @@
 """P/Q parity computation and stripe reconstruction over GF(2^8).
 
-A stripe consists of ``data_count`` data shards followed by two parity
-shards:
+A stripe logically consists of ``data_count`` data shards plus two
+parity shards:
 
-* P (index ``data_count``)     -- bytewise XOR of all data shards.
-* Q (index ``data_count + 1``) -- sum over GF(2^8) of ``2**i * D_i``
-  where ``i`` is the zero-based data shard index and 2 is the field
-  generator (primitive polynomial 0x11d).
+* P -- bytewise XOR of all data shards.
+* Q -- sum over GF(2^8) of ``2**i * D_i`` where ``i`` is the zero-based
+  *logical* data shard index and 2 is the field generator (primitive
+  polynomial 0x11d).
+
+Newer array controllers may place P and Q in any two distinct physical
+slots to rotate write load. :func:`reconstruct_stripe` therefore takes
+explicit ``p_index``/``q_index`` physical positions; the remaining
+physical slots, in ascending order, are D0..Dn-1. When the indices are
+omitted the canonical layout (P and Q in the final two slots) is used.
 
 Any one or two missing shards can be reconstructed from the survivors.
 """
@@ -60,17 +66,81 @@ def parity_defects(data_shards: list[bytes], p: bytes, q: bytes) -> list[str]:
     return defects
 
 
+def logical_layout(
+    data_count: int,
+    p_index: int | None = None,
+    q_index: int | None = None,
+) -> tuple[list[int], int, int]:
+    """Return ``(data_slots, p_index, q_index)`` physical slot indices.
+
+    The data slots are the physical positions other than the P/Q slots,
+    in ascending physical order; their list position is the logical data
+    shard index (D0, D1, ...). When ``p_index``/``q_index`` are omitted
+    the canonical layout applies: P then Q in the last two slots.
+    """
+    total = data_count + 2
+    if p_index is None:
+        p_index = data_count
+    if q_index is None:
+        q_index = data_count + 1
+    if not (0 <= p_index < total and 0 <= q_index < total):
+        raise ValueError("parity indices must be within [0, %d)" % total)
+    if p_index == q_index:
+        raise ValueError("P and Q must occupy distinct physical slots")
+    data_slots = [i for i in range(total) if i != p_index and i != q_index]
+    return data_slots, p_index, q_index
+
+
 def reconstruct_stripe(
-    shards: list[bytes | None], data_count: int
+    shards: list[bytes | None],
+    data_count: int,
+    p_index: int | None = None,
+    q_index: int | None = None,
 ) -> tuple[list[bytes], list[int]]:
     """Reconstruct a full stripe from ``shards`` (None marks a missing shard).
 
-    ``shards`` must have ``data_count + 2`` entries; the last two are the
-    P and Q parity shards. Returns ``(full_shards, recovered_indices)``.
+    ``shards`` must have ``data_count + 2`` entries kept in *physical*
+    slot order. ``p_index``/``q_index`` name the physical slots holding
+    P and Q; every other physical slot, in ascending order, holds
+    D0..D(n-1). The Q coefficient of a data shard is ``2**i`` for its
+    logical index ``i`` regardless of where the controller placed it.
+    When the parity indices are omitted the canonical layout (P, Q in
+    the last two slots) is assumed.
+
+    Returns ``(full_shards, recovered_indices)`` in physical slot order.
     Raises :class:`TooManyMissingShards` when more than two are missing.
     """
     if len(shards) != data_count + 2:
         raise ValueError("expected %d shards, got %d" % (data_count + 2, len(shards)))
+    data_slots, p_index, q_index = logical_layout(data_count, p_index, q_index)
+
+    # Remap the physical stripe into the canonical logical order
+    # [D0, ..., Dn-1, P, Q] so the erasure math below stays layout-free.
+    logical = [shards[slot] for slot in data_slots]
+    logical.append(shards[p_index])
+    logical.append(shards[q_index])
+
+    full_logical, recovered_logical = _reconstruct_canonical(logical, data_count)
+
+    full: list[bytes | None] = [None] * (data_count + 2)
+    for logical_i, physical_i in enumerate(data_slots):
+        full[physical_i] = full_logical[logical_i]
+    full[p_index] = full_logical[data_count]
+    full[q_index] = full_logical[data_count + 1]
+
+    physical_by_logical = {logical: physical
+                           for logical, physical in enumerate(data_slots)}
+    physical_by_logical[data_count] = p_index
+    physical_by_logical[data_count + 1] = q_index
+    recovered = sorted(physical_by_logical[i] for i in recovered_logical)
+
+    return [s for s in full], recovered  # type: ignore[list-item]
+
+
+def _reconstruct_canonical(
+    shards: list[bytes | None], data_count: int
+) -> tuple[list[bytes], list[int]]:
+    """Reconstruct a stripe laid out as [D0, ..., Dn-1, P, Q]."""
     missing = [i for i, s in enumerate(shards) if s is None]
     if len(missing) > 2:
         raise TooManyMissingShards(missing)
