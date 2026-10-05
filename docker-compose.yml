@@ -1,0 +1,35 @@
+name: stripe-reconstructor
+
+services:
+  app:
+    build: .
+    image: stripe-reconstructor:1.0.0
+    environment:
+      PORT: 8000
+    ports:
+      # Host port is configurable via APP_PORT (default 8000).
+      - "${APP_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+
+  # One-shot verification: waits for the app health check, then runs the
+  # unit tests, the publishable package build and an API smoke test.
+  # Its exit code reports the overall result and the container stops.
+  verify:
+    image: stripe-reconstructor:1.0.0
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: http://app:8000
+    command: ["python", "verify.py"]
+    restart: "no"

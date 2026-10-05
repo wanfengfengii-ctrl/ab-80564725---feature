@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stripe-reconstructor"
+version = "1.0.0"
+description = "RAID-6 style dual-parity (P/Q) stripe reconstruction service over GF(2^8), polynomial 0x11d"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.urls]
+Source = "https://example.invalid/stripe-reconstructor"
+
+[tool.setuptools]
+packages = ["app"]
